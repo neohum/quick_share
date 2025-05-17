@@ -274,7 +274,8 @@ app.post('/api/rooms/:roomCode/files', upload.single('file'), async (req, res) =
     // Socket.IO를 통해 실시간으로 파일 업로드 알림 전송
     io.to(roomCode).emit('fileUploaded', {
       file: fileInfo,
-      message: '새 파일이 업로드되었습니다.'
+      message: '새 파일이 업로드되었습니다.',
+      uploaderId: req.body.socketId || null // 업로더의 Socket ID 포함
     });
 
     res.json({
@@ -492,7 +493,8 @@ app.get('/api/rooms/:roomCode/files/download-all', async (req, res) => {
       originalName: file.originalName,
       filename: file.filename,
       size: file.size,
-      mimetype: file.mimetype
+      mimetype: file.mimetype,
+      userName: file.userName || '익명' // 사용자 이름 추가
     }));
 
     res.json({
