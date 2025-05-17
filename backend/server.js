@@ -57,9 +57,10 @@ io.on('connection', (socket) => {
   console.log('새로운 사용자 연결:', socket.id);
 
   // 방 참여 이벤트
-  socket.on('joinRoom', (roomCode) => {
+  socket.on('joinRoom', (roomCode, userName) => {
     socket.join(roomCode);
-    console.log(`사용자 ${socket.id}가 방 ${roomCode}에 참여했습니다.`);
+    socket.userName = userName || '익명';
+    console.log(`사용자 ${socket.userName}(${socket.id})가 방 ${roomCode}에 참여했습니다.`);
   });
 
   // 연결 해제 이벤트
@@ -219,6 +220,15 @@ app.get('/api/rooms/:roomCode/status', async (req, res) => {
 app.post('/api/rooms/:roomCode/files', upload.single('file'), async (req, res) => {
   try {
     const { roomCode } = req.params;
+    // 사용자 이름 가져오기 (기본값: '익명')
+    const userName = req.body.userName || '익명';
+
+    console.log('파일 업로드 요청 정보:', {
+      roomCode,
+      userName,
+      body: req.body,
+      file: req.file ? req.file.originalname : '파일 없음'
+    });
 
     if (!rooms.has(roomCode)) {
       // 임시 파일 삭제
@@ -245,7 +255,8 @@ app.post('/api/rooms/:roomCode/files', upload.single('file'), async (req, res) =
       path: req.file.path,
       size: req.file.size,
       mimetype: req.file.mimetype,
-      uploadedAt: Date.now()
+      uploadedAt: Date.now(),
+      userName: userName // 사용자 이름 추가
     };
 
     // Redis에 파일 정보 저장 (만료시간 1시간 = 3600초)
@@ -456,6 +467,41 @@ app.post('/api/rooms/:roomCode/files/:fileId/open', async (req, res) => {
   } catch (error) {
     console.error('파일 열기 이벤트 오류:', error);
     res.status(500).json({ message: '파일 열기 이벤트 전파에 실패했습니다.' });
+  }
+});
+
+// 전체 파일 목록 API (다운로드용)
+app.get('/api/rooms/:roomCode/files/download-all', async (req, res) => {
+  try {
+    const { roomCode } = req.params;
+
+    if (!rooms.has(roomCode)) {
+      return res.status(404).json({ message: '존재하지 않는 방입니다.' });
+    }
+
+    const room = rooms.get(roomCode);
+    const files = room.files || [];
+
+    if (files.length === 0) {
+      return res.status(404).json({ message: '다운로드할 파일이 없습니다.' });
+    }
+
+    // 파일 목록 반환 (다운로드에 필요한 모든 정보 포함)
+    const fileList = files.map(file => ({
+      id: file.id,
+      originalName: file.originalName,
+      filename: file.filename,
+      size: file.size,
+      mimetype: file.mimetype
+    }));
+
+    res.json({
+      success: true,
+      files: fileList
+    });
+  } catch (error) {
+    console.error('전체 파일 목록 조회 오류:', error);
+    res.status(500).json({ message: '전체 파일 목록 조회에 실패했습니다.' });
   }
 });
 
