@@ -6,14 +6,40 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const socketIo = require('socket.io');
+const cron = require('node-cron');
 
 const app = express();
 const server = http.createServer(app);
+// 프론트엔드 URL 설정 (환경 변수 또는 기본값)
+const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:8080';
+console.log('프론트엔드 URL:', frontendUrl);
+
+// 허용할 오리진 목록
+const allowedOrigins = [
+  frontendUrl,
+  'http://localhost:8080',
+  'http://localhost:8081',
+  'http://localhost:3000',
+  'http://127.0.0.1:8080',
+  'http://127.0.0.1:8081',
+  'http://127.0.0.1:3000',
+  'https://file2.schoolworks.dev',
+  'https://www.file2.schoolworks.dev'
+];
+
 const io = socketIo(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization']
+  },
+  // 연결 유지 관련 설정
+  pingTimeout: 60000,        // 핑 타임아웃 (60초)
+  pingInterval: 25000,       // 핑 간격 (25초)
+  connectTimeout: 30000,     // 연결 타임아웃 (30초)
+  maxHttpBufferSize: 5e6,    // 최대 HTTP 버퍼 크기 (5MB)
+  transports: ['websocket', 'polling']  // 웹소켓 우선, 폴링 백업
 });
 
 // Redis 연결 설정
@@ -21,6 +47,23 @@ const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: process.env.REDIS_PORT || 6379,
   password: process.env.REDIS_PASSWORD || '',
+  retryStrategy: function(times) {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  }
+});
+
+// Redis 연결 이벤트 처리
+redis.on('connect', () => {
+  console.log('Redis 서버에 연결되었습니다.');
+});
+
+redis.on('error', (err) => {
+  console.error('Redis 연결 오류:', err);
+});
+
+redis.on('ready', () => {
+  console.log('Redis 서버가 준비되었습니다.');
 });
 
 // 파일 업로드를 위한 임시 디렉토리 설정
@@ -46,26 +89,98 @@ const upload = multer({ storage: storage });
 
 // CORS 설정을 가장 먼저 적용
 app.use(cors({
-  origin: '*', // 모든 원본 허용 (개발용)
+  origin: function(origin, callback) {
+    // origin이 undefined인 경우는 같은 도메인에서의 요청
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('CORS 오류 - 허용되지 않은 오리진:', origin);
+      // 개발 환경에서는 모든 오리진 허용 (프로덕션에서는 제거)
+      callback(null, true);
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type'],
+  credentials: true
 }));
+
+// CORS 프리플라이트 요청을 위한 OPTIONS 메서드 처리
+app.options('*', (req, res) => {
+  // 필요한 CORS 헤더 설정
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400'); // 24시간
+  res.sendStatus(200);
+});
+
+// 모든 요청에 CORS 헤더 추가
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  next();
+});
 
 // Socket.IO 연결 설정
 io.on('connection', (socket) => {
   console.log('새로운 사용자 연결:', socket.id);
 
+  // 소켓 정보 저장
+  socket.data = {
+    roomCode: null,
+    userName: null,
+    lastActivity: Date.now()
+  };
+
   // 방 참여 이벤트
   socket.on('joinRoom', (roomCode, userName) => {
+    // 이전에 참여한 방이 있으면 나가기
+    if (socket.data.roomCode) {
+      socket.leave(socket.data.roomCode);
+    }
+
+    // 새 방에 참여
     socket.join(roomCode);
-    socket.userName = userName || '익명';
-    console.log(`사용자 ${socket.userName}(${socket.id})가 방 ${roomCode}에 참여했습니다.`);
+
+    // 소켓 데이터 업데이트
+    socket.data.roomCode = roomCode;
+    socket.data.userName = userName || '익명';
+    socket.data.lastActivity = Date.now();
+
+    console.log(`사용자 ${socket.data.userName}(${socket.id})가 방 ${roomCode}에 참여했습니다.`);
+
+    // 클라이언트에게 참여 확인 메시지 전송
+    socket.emit('joinedRoom', {
+      roomCode,
+      userName: socket.data.userName,
+      message: '방에 성공적으로 참여했습니다.'
+    });
+  });
+
+  // 핑 이벤트 (연결 유지 확인)
+  socket.on('ping', (callback) => {
+    socket.data.lastActivity = Date.now();
+    if (typeof callback === 'function') {
+      callback({ status: 'ok', time: Date.now() });
+    }
   });
 
   // 연결 해제 이벤트
-  socket.on('disconnect', () => {
-    console.log('사용자 연결 해제:', socket.id);
+  socket.on('disconnect', (reason) => {
+    console.log(`사용자 연결 해제 (${reason}):`, socket.id,
+      socket.data.userName ? `사용자명: ${socket.data.userName}` : '');
+  });
+
+  // 오류 이벤트
+  socket.on('error', (error) => {
+    console.error('소켓 오류:', error);
   });
 });
 
@@ -248,6 +363,10 @@ app.post('/api/rooms/:roomCode/files', upload.single('file'), async (req, res) =
     // 고유 ID 생성
     const uniqueId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
 
+    // 현재 시간과 만료 시간 계산 (1시간 후)
+    const now = Date.now();
+    const expiresAt = now + 3600000; // 1시간 = 3600000 밀리초
+
     const fileInfo = {
       id: uniqueId,
       originalName: originalName,
@@ -255,7 +374,8 @@ app.post('/api/rooms/:roomCode/files', upload.single('file'), async (req, res) =
       path: req.file.path,
       size: req.file.size,
       mimetype: req.file.mimetype,
-      uploadedAt: Date.now(),
+      uploadedAt: now,
+      expiresAt: expiresAt, // 만료 시간 추가
       userName: userName // 사용자 이름 추가
     };
 
@@ -507,7 +627,102 @@ app.get('/api/rooms/:roomCode/files/download-all', async (req, res) => {
   }
 });
 
+// 만료된 파일 확인 및 삭제 함수
+const checkExpiredFiles = async () => {
+  console.log('만료된 파일 확인 시작...');
+  const now = Date.now();
+  let expiredCount = 0;
+
+  try {
+    // 모든 방 순회
+    for (const [roomCode, room] of rooms.entries()) {
+      if (!room.files || room.files.length === 0) continue;
+
+      // 만료된 파일 필터링
+      const expiredFiles = room.files.filter(file => file.expiresAt && file.expiresAt <= now);
+      if (expiredFiles.length === 0) continue;
+
+      console.log(`방 ${roomCode}에서 ${expiredFiles.length}개의 만료된 파일 발견`);
+
+      // 만료된 파일 삭제
+      for (const file of expiredFiles) {
+        try {
+          // 파일 시스템에서 삭제
+          if (fs.existsSync(file.path)) {
+            fs.unlinkSync(file.path);
+          }
+
+          // Redis에서 파일 정보 삭제
+          const fileKey = `room:${roomCode}:files`;
+          await redis.lrem(fileKey, 0, JSON.stringify(file));
+
+          // Socket.IO를 통해 실시간으로 파일 삭제 알림 전송
+          io.to(roomCode).emit('fileDeleted', {
+            id: file.id,
+            filename: file.filename,
+            reason: 'expired'
+          });
+
+          expiredCount++;
+        } catch (err) {
+          console.error(`파일 삭제 오류 (${file.filename}):`, err);
+        }
+      }
+
+      // 방 정보에서 만료된 파일 제거
+      room.files = room.files.filter(file => !file.expiresAt || file.expiresAt > now);
+    }
+
+    console.log(`만료된 파일 확인 완료: ${expiredCount}개 파일 삭제됨`);
+  } catch (error) {
+    console.error('만료된 파일 확인 중 오류 발생:', error);
+  }
+};
+
+// 업로드 디렉토리의 모든 파일 삭제 함수
+const cleanUploadDirectory = () => {
+  console.log('업로드 디렉토리 정리 시작...');
+
+  try {
+    // 업로드 디렉토리의 모든 파일 목록 가져오기
+    const files = fs.readdirSync(uploadDir);
+
+    // 각 파일 삭제
+    let deletedCount = 0;
+    for (const file of files) {
+      const filePath = path.join(uploadDir, file);
+
+      // 파일 상태 확인
+      const stats = fs.statSync(filePath);
+
+      // 디렉토리가 아닌 파일만 삭제
+      if (stats.isFile()) {
+        fs.unlinkSync(filePath);
+        deletedCount++;
+      }
+    }
+
+    console.log(`업로드 디렉토리 정리 완료: ${deletedCount}개 파일 삭제됨`);
+  } catch (error) {
+    console.error('업로드 디렉토리 정리 중 오류 발생:', error);
+  }
+};
+
+// 매일 자정(00:00)에 실행되는 cron 작업 설정
+cron.schedule('0 0 * * *', () => {
+  console.log('자정 정리 작업 시작...');
+  cleanUploadDirectory();
+});
+
+// 1분마다 만료된 파일 확인 및 삭제
+cron.schedule('* * * * *', () => {
+  checkExpiredFiles();
+});
+
 const port = process.env.PORT || 3001;
 server.listen(port, () => {
   console.log(`서버가 포트 ${port}에서 실행 중입니다.`);
+
+  // 서버 시작 시 만료된 파일 확인 및 삭제
+  checkExpiredFiles();
 });

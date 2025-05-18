@@ -65,7 +65,7 @@ import axios from 'axios';
 
 // axios 인스턴스 생성
 const api = axios.create({
-  baseURL: `${process.env.VUE_APP_API_URL}/api`,
+  baseURL: `https://file2.schoolworks.dev/api`,
   timeout: 5000,
   headers: {
     'Content-Type': 'application/json'
