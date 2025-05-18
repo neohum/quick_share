@@ -12,25 +12,13 @@
       <div class="room-info">
         <div class="room-code-container">
           <h2>방 코드: {{ roomCode }}</h2>
-          <button @click="showQrCode()" class="qr-code-button">
-            QR코드 보기
-          </button>
-        </div>
-        <div class="user-name-container">
-          <span v-if="!isEditingUserName" @click="startEditUserName" class="user-name">
-            <span class="user-name-label">사용자:</span>
-            <span class="current-user-name">{{ userName }}</span>
-            <span class="edit-icon">✏️</span>
-          </span>
-          <div v-else class="user-name-edit">
-            <input
-              ref="userNameInput"
-              v-model="editUserName"
-              @keyup.enter="saveUserName"
-              @blur="saveUserName"
-              placeholder="사용자 이름 입력"
-              class="user-name-input"
-            />
+          <div class="room-buttons">
+            <button @click="showQrCode()" class="qr-code-button">
+              QR코드 보기
+            </button>
+            <button @click="navigateToHome()" class="home-button">
+              홈으로
+            </button>
           </div>
         </div>
       </div>
@@ -146,6 +134,10 @@
                 <div class="file-details">
                   <span class="file-size">{{ formatFileSize(file.size) }}</span>
                   <span class="file-date">{{ formatDate(file.uploadedAt) }}</span>
+                  <!-- 만료 시간 표시 -->
+                  <span v-if="file.expiresAt" class="file-expiry" :class="{ 'expiry-soon': isExpiringSoon(file) }">
+                    만료: {{ formatExpiryTime(file.expiresAt) }}
+                  </span>
                   <!-- 디버깅용 -->
                   <span class="debug-info" style="display: none;">{{ JSON.stringify(file) }}</span>
                   <span v-if="file.viewCount > 0" class="view-count">{{ file.viewCount }} 명 보는 중</span>
@@ -175,7 +167,18 @@
         <div class="qr-code-modal-body">
           <div class="qr-code-large" ref="qrcodeLarge"></div>
           <p class="qr-code-modal-text">이 QR 코드를 스캔하여 방에 참여하세요</p>
+          <p class="qr-code-modal-room">방 코드: {{ roomCode }}</p>
         </div>
+      </div>
+    </div>
+
+    <!-- 연결 상태 표시 배너 -->
+    <div v-if="!isSocketConnected" class="connection-status-banner">
+      <div class="connection-status-icon">
+        <span class="connection-dot"></span>
+      </div>
+      <div class="connection-status-text">
+        서버와의 연결이 끊겼습니다. 재연결 중...
       </div>
     </div>
 
@@ -278,15 +281,19 @@ function generateUUID() {
 export default {
   name: 'RoomView',
   data() {
-    const apiBaseUrl = process.env.VUE_APP_API_URL || 'http://localhost:3001';
+    const apiBaseUrl = process.env.VUE_APP_API_URL;
 
     return {
       roomCode: this.$route.params.roomId,
       expiresIn: 3600,
       timerInterval: null,
+      localTimerInterval: null,
       apiUrl: apiBaseUrl,
       socketUrl: apiBaseUrl,
       socket: null,
+      isSocketConnected: false,
+      pingInterval: null,
+      lastPongTime: null,
       selectedFile: null,
       isUploading: false,
       uploadProgress: 0,
@@ -383,20 +390,38 @@ export default {
     }
   },
   beforeDestroy() {
+    // 타이머 정리
     if (this.timerInterval) {
-      clearInterval(this.timerInterval)
+      clearInterval(this.timerInterval);
+    }
+
+    if (this.localTimerInterval) {
+      clearInterval(this.localTimerInterval);
+    }
+
+    // 핑 타이머 정리
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
     }
 
     // Socket.IO 연결 해제
     if (this.socket) {
-      this.socket.disconnect()
+      // 연결 해제 전에 로그 출력
+      console.log('컴포넌트 소멸 시 Socket.IO 연결 해제');
+
+      // 명시적으로 연결 해제
+      this.socket.disconnect();
+      this.socket = null;
     }
   },
   methods: {
     async joinOrCreateRoom() {
       try {
         // 방 참여 시도
-        const response = await axios.post(`${this.apiUrl}/api/rooms/${this.roomCode}`)
+        const response = await axios.post(`${this.apiUrl}/api/rooms/${this.roomCode}`, {}, 
+          { withCredentials: true }
+        )
         this.expiresIn = response.data.expiresIn || 3600
 
         // 처음 참여하는 경우에만 알림 표시
@@ -410,7 +435,9 @@ export default {
           if (/^\d{6}$/.test(this.roomCode)) {
             // 방 생성 시도
             try {
-              const createResponse = await axios.post(`${this.apiUrl}/api/rooms`, { roomCode: this.roomCode })
+              const createResponse = await axios.post(`${this.apiUrl}/api/rooms`, { roomCode: this.roomCode }, {
+                withCredentials: true
+              })
               this.expiresIn = createResponse.data.expiresIn || 3600
               this.showNotification('새 방이 생성되었습니다.')
               this.hasJoinedRoom = true
@@ -429,13 +456,26 @@ export default {
 
     async checkRoomStatus() {
       try {
-        const response = await axios.get(`${this.apiUrl}/api/rooms/${this.roomCode}/status`)
+        const response = await axios.get(`${this.apiUrl}/api/rooms/${this.roomCode}/status`, {
+          withCredentials: true
+        })
         if (!response.data.active) {
           this.navigateToHome()
           alert('방이 만료되었습니다.')
           return
         }
-        this.expiresIn = response.data.expiresIn
+
+        // 서버에서 받은 만료 시간으로 업데이트
+        const serverExpiresIn = response.data.expiresIn
+
+        // 만료 시간이 변경된 경우에만 업데이트
+        if (this.expiresIn !== serverExpiresIn) {
+          console.log('서버 만료 시간으로 업데이트:', serverExpiresIn)
+          this.expiresIn = serverExpiresIn
+
+          // 로컬 타이머 재시작
+          this.updateTimer()
+        }
       } catch (error) {
         console.error('방 상태 확인 실패:', error)
         this.navigateToHome()
@@ -450,15 +490,28 @@ export default {
       })
     },
     startExpiryTimer() {
+      // 초기 타이머 시작
+      this.updateTimer()
+
+      // 5초마다 서버에서 실제 만료 시간 확인
       this.timerInterval = setInterval(() => {
+        this.checkRoomStatus()
+      }, 5000)
+    },
+
+    updateTimer() {
+      // 로컬 타이머 (서버 업데이트 사이에 사용)
+      if (this.localTimerInterval) {
+        clearInterval(this.localTimerInterval)
+      }
+
+      this.localTimerInterval = setInterval(() => {
         this.expiresIn--
         if (this.expiresIn <= 0) {
+          clearInterval(this.localTimerInterval)
           clearInterval(this.timerInterval)
           this.navigateToHome()
           alert('방이 만료되었습니다.')
-        } else if (this.expiresIn % 60 === 0) {
-          // 1분마다 서버에서 실제 만료 시간 확인
-          this.checkRoomStatus()
         }
       }, 1000)
     },
@@ -586,6 +639,7 @@ export default {
             headers: {
               'Content-Type': 'multipart/form-data'
             },
+            withCredentials: true,
             timeout: 60000, // 60초로 타임아웃 시간 증가
             onUploadProgress: progressEvent => {
               const percentCompleted = Math.round(
@@ -661,7 +715,9 @@ export default {
       this.isLoading = true
 
       try {
-        const response = await axios.get(`${this.apiUrl}/api/rooms/${this.roomCode}/files`)
+        const response = await axios.get(`${this.apiUrl}/api/rooms/${this.roomCode}/files`, {
+          withCredentials: true
+        })
         const files = response.data.files || []
 
         // 중복 파일 제거 및 고유 ID 할당
@@ -716,6 +772,7 @@ export default {
           url: downloadUrl,
           method: 'GET',
           responseType: 'blob',
+          withCredentials: true,
           timeout: 60000 // 60초 타임아웃
         })
 
@@ -756,7 +813,9 @@ export default {
       }
 
       try {
-        const response = await axios.delete(`${this.apiUrl}/api/rooms/${this.roomCode}/files/${file.id}`)
+        const response = await axios.delete(`${this.apiUrl}/api/rooms/${this.roomCode}/files/${file.id}`, {
+          withCredentials: true
+        })
 
         // 파일 목록에서 삭제
         const fileIndex = this.files.findIndex(f => f.id === file.id)
@@ -811,6 +870,7 @@ export default {
               url: downloadUrl,
               method: 'GET',
               responseType: 'blob',
+              withCredentials: true,
               timeout: 60000 // 60초로 타임아웃 증가
             })
 
@@ -897,8 +957,76 @@ export default {
 
     // 날짜 포맷팅
     formatDate(timestamp) {
+      if (!timestamp) return '알 수 없음'
+
       const date = new Date(timestamp)
-      return date.toLocaleString()
+      const now = new Date()
+
+      // 오늘 날짜인 경우 시간만 표시
+      if (date.toDateString() === now.toDateString()) {
+        return `오늘 ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
+      }
+
+      // 어제 날짜인 경우 '어제'로 표시
+      const yesterday = new Date(now)
+      yesterday.setDate(now.getDate() - 1)
+      if (date.toDateString() === yesterday.toDateString()) {
+        return `어제 ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
+      }
+
+      // 그 외의 경우 날짜와 시간 모두 표시
+      return `${date.getMonth() + 1}/${date.getDate()} ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
+    },
+
+    // 파일 만료 시간 포맷
+    formatExpiryTime(timestamp) {
+      if (!timestamp) return '알 수 없음'
+
+      const expiryDate = new Date(timestamp)
+      const now = new Date()
+
+      // 남은 시간 계산 (밀리초)
+      const remainingTime = expiryDate - now
+
+      // 이미 만료된 경우
+      if (remainingTime <= 0) {
+        return '만료됨'
+      }
+
+      // 1시간 이내인 경우 분 단위로 표시
+      if (remainingTime < 3600000) {
+        const minutes = Math.ceil(remainingTime / 60000)
+        return `${minutes}분 후`
+      }
+
+      // 오늘 만료되는 경우 시간만 표시
+      if (expiryDate.toDateString() === now.toDateString()) {
+        return `오늘 ${expiryDate.getHours().toString().padStart(2, '0')}:${expiryDate.getMinutes().toString().padStart(2, '0')}`
+      }
+
+      // 내일 만료되는 경우 '내일'로 표시
+      const tomorrow = new Date(now)
+      tomorrow.setDate(now.getDate() + 1)
+      if (expiryDate.toDateString() === tomorrow.toDateString()) {
+        return `내일 ${expiryDate.getHours().toString().padStart(2, '0')}:${expiryDate.getMinutes().toString().padStart(2, '0')}`
+      }
+
+      // 그 외의 경우 날짜와 시간 모두 표시
+      return `${expiryDate.getMonth() + 1}/${expiryDate.getDate()} ${expiryDate.getHours().toString().padStart(2, '0')}:${expiryDate.getMinutes().toString().padStart(2, '0')}`
+    },
+
+    // 파일이 곧 만료되는지 확인 (30분 이내)
+    isExpiringSoon(file) {
+      if (!file.expiresAt) return false
+
+      const expiryDate = new Date(file.expiresAt)
+      const now = new Date()
+
+      // 남은 시간 계산 (밀리초)
+      const remainingTime = expiryDate - now
+
+      // 30분(1800000 밀리초) 이내인 경우 true 반환
+      return remainingTime > 0 && remainingTime < 1800000
     },
 
     // 사용자 이름 편집 시작
@@ -969,23 +1097,54 @@ export default {
     },
 
     // 모달 내 QR 코드 생성
-    generateQrCodeInModal() {
+    async generateQrCodeInModal() {
       try {
         if (this.$refs.qrcodeLarge) {
           const qrCodeElement = this.$refs.qrcodeLarge;
 
-          // QR 코드 이미지 생성 (더 큰 사이즈로)
-          const qrCodeImg = document.createElement('img');
-          qrCodeImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(this.qrCodeUrl)}`;
-          qrCodeImg.alt = 'QR 코드';
-          qrCodeImg.className = 'qr-code-img-large';
-
-          // 기존 내용 제거 후 QR 코드 이미지 추가
+          // 기존 내용 제거
           qrCodeElement.innerHTML = '';
-          qrCodeElement.appendChild(qrCodeImg);
+
+          // QR 코드 생성 중 로딩 표시
+          const loadingElement = document.createElement('div');
+          loadingElement.className = 'qr-loading';
+          loadingElement.textContent = 'QR 코드 생성 중...';
+          qrCodeElement.appendChild(loadingElement);
+
+          // QR 코드 캔버스 생성
+          const canvas = document.createElement('canvas');
+
+          // QR 코드 생성 (비동기)
+          await this.$qrcode.toCanvas(canvas, this.qrCodeUrl, {
+            width: 400,
+            margin: 4,
+            color: {
+              dark: '#000000',
+              light: '#ffffff'
+            },
+            errorCorrectionLevel: 'H' // 높은 오류 수정 레벨
+          });
+
+          // 로딩 요소 제거
+          qrCodeElement.innerHTML = '';
+
+          // 캔버스 추가
+          canvas.className = 'qr-code-img-large';
+          qrCodeElement.appendChild(canvas);
+
+          // 아래에 URL 텍스트 추가
+          const urlText = document.createElement('div');
+          urlText.className = 'qr-url-text';
+          urlText.textContent = this.qrCodeUrl;
+          qrCodeElement.appendChild(urlText);
         }
       } catch (error) {
         console.error('QR 코드 생성 오류:', error);
+
+        // 오류 발생 시 사용자에게 알림
+        if (this.$refs.qrcodeLarge) {
+          this.$refs.qrcodeLarge.innerHTML = '<div class="qr-error">QR 코드 생성 중 오류가 발생했습니다.</div>';
+        }
       }
     },
 
@@ -1049,7 +1208,8 @@ export default {
           const response = await axios({
             url: downloadUrl,
             method: 'GET',
-            responseType: 'text'
+            responseType: 'text',
+            withCredentials: true
           })
           this.previewModal.textContent = response.data
         }
@@ -1128,14 +1288,23 @@ export default {
       // Socket.IO 연결 생성
       this.socket = io(this.socketUrl, {
         reconnection: true,        // 자동 재연결 활성화
-        reconnectionAttempts: 10,  // 최대 10번 재연결 시도
+        reconnectionAttempts: 20,  // 최대 20번 재연결 시도
         reconnectionDelay: 1000,   // 재연결 시도 간격 (1초)
-        timeout: 20000             // 연결 타임아웃 (20초)
+        reconnectionDelayMax: 5000, // 최대 재연결 지연 시간 (5초)
+        timeout: 30000,            // 연결 타임아웃 (30초)
+        transports: ['websocket', 'polling'], // 웹소켓 우선, 폴링 백업
+        withCredentials: true,     // 인증 정보 포함
+        extraHeaders: {            // 추가 헤더
+          'Access-Control-Allow-Origin': window.location.origin
+        }
       });
 
       // 연결 이벤트
       this.socket.on('connect', () => {
-        console.log('Socket.IO 연결 성공')
+        console.log('Socket.IO 연결 성공:', this.socket.id);
+
+        // 연결 상태 표시
+        this.isSocketConnected = true;
 
         // URL에서 직접 사용자 이름 추출
         const urlParams = new URLSearchParams(window.location.search);
@@ -1149,12 +1318,23 @@ export default {
         this.userName = userName;
 
         // 방에 참여 (사용자 이름도 전송)
-        this.socket.emit('joinRoom', this.roomCode, userName)
-      })
+        this.socket.emit('joinRoom', this.roomCode, userName);
+
+        // 핑 타이머 시작
+        this.startPingTimer();
+      });
+
+      // 방 참여 확인 이벤트
+      this.socket.on('joinedRoom', (data) => {
+        console.log('방 참여 확인:', data);
+      });
 
       // 재연결 이벤트
       this.socket.on('reconnect', (attemptNumber) => {
         console.log(`Socket.IO 재연결 성공 (시도 ${attemptNumber}번째)`);
+
+        // 연결 상태 표시
+        this.isSocketConnected = true;
 
         // 재연결 시 방에 다시 참여
         const urlParams = new URLSearchParams(window.location.search);
@@ -1164,8 +1344,31 @@ export default {
         // 사용자 이름 설정
         this.userName = userName;
 
+        // 방에 다시 참여
         this.socket.emit('joinRoom', this.roomCode, userName);
-      })
+
+        // 핑 타이머 재시작
+        this.startPingTimer();
+      });
+
+      // 재연결 시도 이벤트
+      this.socket.on('reconnect_attempt', (attemptNumber) => {
+        console.log(`Socket.IO 재연결 시도 중 (${attemptNumber}번째)...`);
+      });
+
+      // 재연결 오류 이벤트
+      this.socket.on('reconnect_error', (error) => {
+        console.error('Socket.IO 재연결 오류:', error);
+      });
+
+      // 재연결 실패 이벤트
+      this.socket.on('reconnect_failed', () => {
+        console.error('Socket.IO 재연결 실패 (최대 시도 횟수 초과)');
+        this.isSocketConnected = false;
+
+        // 사용자에게 알림
+        this.showNotification('서버 연결이 끊겼습니다. 페이지를 새로고침해 주세요.', 10000, true);
+      });
 
       // 파일 업로드 이벤트
       this.socket.on('fileUploaded', (data) => {
@@ -1220,15 +1423,67 @@ export default {
         )
 
         if (fileIndex !== -1) {
+          const deletedFile = this.files[fileIndex];
           this.files.splice(fileIndex, 1)
-          this.showNotification('파일이 삭제되었습니다.')
+
+          // 삭제 이유에 따라 다른 알림 표시
+          if (data.reason === 'expired') {
+            this.showNotification(`"${deletedFile.originalName}" 파일이 만료되어 자동으로 삭제되었습니다.`, 5000, true);
+          } else {
+            this.showNotification('파일이 삭제되었습니다.');
+          }
         }
       })
 
       // 연결 오류 이벤트
       this.socket.on('connect_error', (error) => {
-        console.error('Socket.IO 연결 오류:', error)
-      })
+        console.error('Socket.IO 연결 오류:', error);
+        this.isSocketConnected = false;
+      });
+
+      // 연결 해제 이벤트
+      this.socket.on('disconnect', (reason) => {
+        console.log('Socket.IO 연결 해제:', reason);
+        this.isSocketConnected = false;
+
+        // 핑 타이머 정리
+        if (this.pingInterval) {
+          clearInterval(this.pingInterval);
+          this.pingInterval = null;
+        }
+
+        // 자동으로 재연결되지 않는 이유인 경우 사용자에게 알림
+        if (reason === 'io server disconnect' || reason === 'io client disconnect') {
+          this.showNotification('서버와의 연결이 끊겼습니다. 페이지를 새로고침해 주세요.', 10000, true);
+        }
+      });
+    },
+
+    // 핑 타이머 시작 (연결 유지를 위한 주기적인 핑 전송)
+    startPingTimer() {
+      // 이미 실행 중인 타이머가 있으면 정리
+      if (this.pingInterval) {
+        clearInterval(this.pingInterval);
+      }
+
+      // 20초마다 서버에 핑 전송
+      this.pingInterval = setInterval(() => {
+        if (this.socket && this.socket.connected) {
+          console.log('서버에 핑 전송...');
+          this.socket.emit('ping', (response) => {
+            if (response && response.status === 'ok') {
+              console.log('서버로부터 퐁 수신:', response.time);
+              this.lastPongTime = response.time;
+            }
+          });
+        } else {
+          console.warn('소켓이 연결되어 있지 않아 핑을 전송할 수 없습니다.');
+
+          // 소켓이 연결되어 있지 않으면 타이머 정리
+          clearInterval(this.pingInterval);
+          this.pingInterval = null;
+        }
+      }, 20000);
     }
   }
 }
@@ -1266,9 +1521,15 @@ export default {
   margin-bottom: 10px;
 }
 
+.room-buttons {
+  display: flex;
+  gap: 10px;
+}
+
 .qr-code-button {
   background-color: var(--primary-color);
   color: black;
+  font: black;
   border: none;
   padding: 8px 16px;
   border-radius: 20px;
@@ -1281,15 +1542,39 @@ export default {
   align-items: center;
 }
 
-.qr-code-button:hover {
+.home-button {
+  background-color: var(--primary-color);
+  color: white;
+  font: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  display: flex;
+  align-items: center;
+}
+
+.qr-code-button:hover, .home-button:hover {
   background-color: var(--primary-dark);
   transform: translateY(-2px);
   box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
 }
 
-.qr-code-button:active {
+.qr-code-button:active, .home-button:active {
   transform: translateY(0);
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.home-button {
+  background-color: #e74c3c; /* 홈 버튼은 다른 색상으로 구분 */
+}
+
+.home-button:hover {
+  background-color: #c0392b;
 }
 
 .qr-code-modal {
@@ -1342,6 +1627,7 @@ export default {
   height: auto;
   aspect-ratio: 1;
   display: flex;
+  flex-direction: column;
   justify-content: center;
   align-items: center;
   margin-bottom: 20px;
@@ -1349,11 +1635,42 @@ export default {
   border-radius: 8px;
   overflow: hidden;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  padding: 20px;
 }
 
 .qr-code-img-large {
   max-width: 100%;
   max-height: 100%;
+  border-radius: 8px;
+}
+
+.qr-loading {
+  padding: 20px;
+  text-align: center;
+  color: #666;
+  font-size: 16px;
+}
+
+.qr-error {
+  padding: 20px;
+  text-align: center;
+  color: #e74c3c;
+  font-size: 16px;
+  background-color: #fdeaea;
+  border-radius: 8px;
+}
+
+.qr-url-text {
+  margin-top: 15px;
+  padding: 10px;
+  background-color: #f8f9fa;
+  border-radius: 8px;
+  font-size: 14px;
+  word-break: break-all;
+  text-align: center;
+  color: #666;
+  border: 1px solid #ddd;
+  width: 100%;
 }
 
 .qr-code-modal-text {
@@ -1361,6 +1678,60 @@ export default {
   color: #555;
   text-align: center;
   margin-top: 20px;
+}
+
+.qr-code-modal-room {
+  font-size: 14px;
+  color: #777;
+  text-align: center;
+  margin-top: 10px;
+  font-weight: 500;
+}
+
+/* 연결 상태 표시 배너 */
+.connection-status-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  background-color: rgba(220, 53, 69, 0.9);
+  color: white;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+  animation: slideDown 0.3s ease-out;
+}
+
+.connection-status-icon {
+  margin-right: 10px;
+}
+
+.connection-dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  background-color: white;
+  border-radius: 50%;
+  animation: blink 1.5s infinite;
+}
+
+.connection-status-text {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+@keyframes blink {
+  0% { opacity: 0.4; }
+  50% { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+@keyframes slideDown {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(0); }
 }
 
 .qr-username-modal {
@@ -2004,7 +2375,7 @@ export default {
 }
 
 .error-message {
-  color: var(--error-color);
+  color: var(--success-color);
   margin-top: 12px;
   font-size: 14px;
   display: flex;
@@ -2012,6 +2383,7 @@ export default {
 }
 
 .error-message::before {
+  color: var(--success-color);
   content: '⚠️';
   margin-top: 24px;
   margin-right: 6px;
@@ -2211,6 +2583,28 @@ export default {
   font-size: 12px;
 }
 
+.file-expiry {
+  color: #777;
+  font-size: 12px;
+  margin-right: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background-color: #f8f9fa;
+}
+
+.file-expiry::before {
+  content: '⏱️';
+  margin-right: 6px;
+  font-size: 12px;
+}
+
+.expiry-soon {
+  color: #fff;
+  background-color: #e74c3c;
+  font-weight: 500;
+  animation: pulse 2s infinite;
+}
+
 .file-uploader {
   display: flex;
   align-items: center; /* 세로 방향 중앙 정렬 */
@@ -2316,7 +2710,7 @@ export default {
   border-left: 5px solid #27ae60; /* 왼쪽 테두리 추가 */
 
   &.error-notification {
-    background-color: var(--error-color);
+    background-color: var(--success-color);
     border-left-color: #c0392b;
   }
 
@@ -2359,10 +2753,15 @@ export default {
     justify-content: center;
   }
 
-  /* QR 코드 모바일 스타일 */
-  .qr-code-button {
+  /* QR 코드 및 홈 버튼 모바일 스타일 */
+  .qr-code-button, .home-button {
     padding: 6px 12px;
     font-size: 12px;
+  }
+
+  .room-buttons {
+    display: flex;
+    gap: 8px;
   }
 
   .qr-code-modal-content {
@@ -2371,6 +2770,28 @@ export default {
 
   .qr-code-large {
     max-width: 280px;
+    padding: 15px;
+  }
+
+  .qr-code-img-large {
+    max-width: 100%;
+    height: auto;
+  }
+
+  .qr-loading {
+    padding: 15px;
+    font-size: 14px;
+  }
+
+  .qr-error {
+    padding: 15px;
+    font-size: 14px;
+  }
+
+  .qr-url-text {
+    margin-top: 10px;
+    padding: 8px;
+    font-size: 12px;
   }
 
   .qr-code-modal-text {
